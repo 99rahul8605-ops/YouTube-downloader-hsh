@@ -1,0 +1,5 @@
+pyrogram==2.0.106
+yt-dlp==2024.4.9
+aiohttp==3.9.3
+python-dotenv==1.0.0
+requests==2.31.0
