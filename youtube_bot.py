@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-YouTube Downloader Bot - Deployable on Render
+YouTube Downloader Bot with FFmpeg - Fixed for Render
 """
 
 import os
 import re
 import sys
+import json
 import asyncio
 import logging
-import aiohttp
+import subprocess
+from pathlib import Path
 from aiohttp import web
-from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram import Client, filters, idle
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 from dotenv import load_dotenv
 
@@ -23,7 +25,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('youtube_bot.log'),
+        logging.FileHandler('bot.log'),
         logging.StreamHandler()
     ]
 )
@@ -34,41 +36,177 @@ API_ID = int(os.getenv('API_ID', 0))
 API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 OWNER_ID = int(os.getenv('OWNER_ID', 0))
-PORT = int(os.getenv('PORT', 8080))  # Render provides this
+PORT = int(os.getenv('PORT', 8080))
 HOST = os.getenv('HOST', '0.0.0.0')
 CREDIT = os.getenv('CREDIT', 'YouTube Downloader Bot')
 
 # Global variables
 processing_request = False
 cancel_requested = False
-DOWNLOAD_PATH = "./downloads"
-COOKIES_FILE = "youtube_cookies.txt"
+current_tasks = {}
 
 # Create necessary directories
-os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+DOWNLOAD_PATH = Path("./downloads")
+COOKIES_FILE = Path("youtube_cookies.txt")
+DOWNLOAD_PATH.mkdir(exist_ok=True)
 
-# Initialize bot
+# Check FFmpeg installation
+def check_ffmpeg():
+    """Check if FFmpeg is installed"""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        logger.info("✅ FFmpeg is installed")
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.error("❌ FFmpeg is not installed")
+        # Try to install FFmpeg on Render
+        try:
+            subprocess.run(['apt-get', 'update'], capture_output=True)
+            subprocess.run(['apt-get', 'install', '-y', 'ffmpeg'], capture_output=True)
+            logger.info("✅ FFmpeg installed via apt-get")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to install FFmpeg: {e}")
+            return False
+
+# Initialize bot with better settings
 bot = Client(
-    "youtube_bot",
+    name="youtube_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=100
+    workers=20,
+    sleep_threshold=60,
+    plugins=dict(root="bot_plugins")
 )
 
 # ============================================================================
-# Progress Hook for yt-dlp
+# Helper Functions
 # ============================================================================
 
-def progress_hook(d, message, status_message_id):
-    """
-    Progress hook for yt-dlp downloads
-    """
+def clean_filename(filename):
+    """Clean filename for safe filesystem use"""
+    # Remove invalid characters
+    cleaned = re.sub(r'[<>:"/\\|?*]', '', filename)
+    # Limit length
+    cleaned = cleaned[:100]
+    return cleaned
+
+async def get_video_info(url, use_cookies=False):
+    """Get YouTube video info"""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+    }
+    
+    if use_cookies and COOKIES_FILE.exists():
+        ydl_opts['cookiefile'] = str(COOKIES_FILE)
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info
+    except Exception as e:
+        logger.error(f"Error getting video info: {e}")
+        return None
+
+def get_available_formats(info):
+    """Get available video formats"""
+    formats = []
+    if 'formats' in info:
+        for fmt in info['formats']:
+            if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
+                height = fmt.get('height', 0)
+                if height:
+                    formats.append({
+                        'height': height,
+                        'ext': fmt.get('ext', 'mp4'),
+                        'format_note': fmt.get('format_note', ''),
+                        'filesize': fmt.get('filesize', 0)
+                    })
+    
+    # Remove duplicates and sort
+    unique_formats = {}
+    for fmt in formats:
+        if fmt['height'] not in unique_formats:
+            unique_formats[fmt['height']] = fmt
+    
+    return sorted(unique_formats.values(), key=lambda x: x['height'])
+
+# ============================================================================
+# Download Functions with FFmpeg
+# ============================================================================
+
+async def download_video_with_progress(url, resolution, chat_id, message_id):
+    """Download video with progress updates"""
     global cancel_requested
     
-    if cancel_requested:
-        raise Exception("Download cancelled by user")
-    
+    try:
+        # Get video info first
+        info = await get_video_info(url, COOKIES_FILE.exists())
+        if not info:
+            return False, "Failed to get video information"
+        
+        video_title = clean_filename(info.get('title', 'video'))
+        
+        # Prepare yt-dlp options
+        ydl_opts = {
+            'format': f'bestvideo[height<={resolution}]+bestaudio/best[height<={resolution}]',
+            'outtmpl': f'{DOWNLOAD_PATH}/{video_title}.%(ext)s',
+            'quiet': False,
+            'no_warnings': False,
+            'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+            'ffmpeg_location': '/usr/bin/ffmpeg',
+            'progress_hooks': [lambda d: asyncio.create_task(
+                progress_callback(d, chat_id, message_id)
+            )],
+        }
+        
+        if COOKIES_FILE.exists():
+            ydl_opts['cookiefile'] = str(COOKIES_FILE)
+        
+        # Start download
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+            
+            # Get output file
+            downloaded_file = ydl.prepare_filename(info)
+            final_file = downloaded_file.replace('.webm', '.mp4').replace('.mkv', '.mp4')
+            
+            if not os.path.exists(final_file):
+                # Try to find the file
+                for ext in ['.mp4', '.mkv', '.webm']:
+                    test_file = downloaded_file.rsplit('.', 1)[0] + ext
+                    if os.path.exists(test_file):
+                        final_file = test_file
+                        break
+            
+            if os.path.exists(final_file):
+                return True, final_file
+            else:
+                return False, "Downloaded file not found"
+                
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        if "Private video" in error_msg:
+            return False, "🔒 Private video - Login required"
+        elif "Members-only" in error_msg:
+            return False, "👥 Members-only video"
+        elif "Sign in" in error_msg:
+            return False, "🔑 Login required - Use /cookies to upload cookies"
+        else:
+            return False, f"Download error: {error_msg[:200]}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+async def progress_callback(d, chat_id, message_id):
+    """Progress callback for yt-dlp"""
     if d['status'] == 'downloading':
         try:
             total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
@@ -78,194 +216,29 @@ def progress_hook(d, message, status_message_id):
             if total and downloaded:
                 percentage = (downloaded / total) * 100
                 
-                # Format speed
-                if speed:
-                    if speed > 1024 * 1024:
-                        speed_str = f"{speed / (1024 * 1024):.1f} MB/s"
-                    elif speed > 1024:
-                        speed_str = f"{speed / 1024:.1f} KB/s"
-                    else:
-                        speed_str = f"{speed:.1f} B/s"
-                else:
-                    speed_str = "Calculating..."
-                
                 # Create progress bar
-                bar_length = 20
-                filled_length = int(bar_length * percentage // 100)
-                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                bar_length = 10
+                filled = int(bar_length * percentage // 100)
+                bar = '▓' * filled + '░' * (bar_length - filled)
                 
                 progress_text = (
-                    f"📥 **Downloading YouTube Video**\n\n"
-                    f"**Progress:** [{bar}] {percentage:.1f}%\n"
-                    f"**Downloaded:** {downloaded / (1024 * 1024):.1f} MB / {total / (1024 * 1024):.1f} MB\n"
-                    f"**Speed:** {speed_str}\n\n"
-                    f"🛑 Send `/cancel` to stop"
+                    f"⬇️ **Downloading...**\n"
+                    f"```[{bar}] {percentage:.1f}%```\n"
+                    f"📊 `{downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB`\n"
+                    f"⚡ `{speed/(1024*1024):.1f} MB/s`\n\n"
+                    f"_Click /cancel to stop_"
                 )
                 
-                # Update message
-                asyncio.create_task(
-                    bot.edit_message_text(
-                        chat_id=message.chat.id,
-                        message_id=status_message_id,
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
                         text=progress_text
                     )
-                )
-                
+                except Exception:
+                    pass
         except Exception as e:
-            logger.error(f"Progress hook error: {e}")
-
-# ============================================================================
-# Download YouTube Video
-# ============================================================================
-
-async def download_youtube_video(url, chat_id, resolution="720"):
-    """
-    Download YouTube video with specified resolution
-    """
-    global processing_request, cancel_requested
-    
-    try:
-        # Map resolution to yt-dlp format
-        resolution_map = {
-            "144": "bv*[height<=144][ext=mp4]+ba[ext=m4a]/b[height<=144]",
-            "240": "bv*[height<=240][ext=mp4]+ba[ext=m4a]/b[height<=240]",
-            "360": "bv*[height<=360][ext=mp4]+ba[ext=m4a]/b[height<=360]",
-            "480": "bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480]",
-            "720": "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720]",
-            "1080": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]",
-            "best": "bv*[ext=mp4]+ba[ext=m4a]/b"
-        }
-        
-        ytf = resolution_map.get(resolution, resolution_map["720"])
-        res_display = f"{resolution}p" if resolution != "best" else "Best Quality"
-        
-        # Get video info
-        ydl_opts_info = {
-            'quiet': True,
-            'no_warnings': True,
-        }
-        
-        # Add cookies if available
-        if os.path.exists(COOKIES_FILE):
-            ydl_opts_info['cookiefile'] = COOKIES_FILE
-        
-        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-            info = ydl.extract_info(url, download=False)
-            video_title = info.get('title', 'YouTube_Video')
-            video_title_clean = re.sub(r'[<>:"/\\|?*]', '', video_title)[:50]
-        
-        # Prepare download options
-        filename = f"{DOWNLOAD_PATH}/{video_title_clean}_{res_display}.%(ext)s"
-        
-        ydl_opts = {
-            'format': ytf,
-            'outtmpl': filename,
-            'quiet': False,
-            'no_warnings': False,
-            'merge_output_format': 'mp4',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
-        }
-        
-        # Add cookies if available
-        if os.path.exists(COOKIES_FILE):
-            ydl_opts['cookiefile'] = COOKIES_FILE
-        
-        # Send status message
-        status_message = await bot.send_message(
-            chat_id=chat_id,
-            text=f"📥 **Downloading YouTube Video**\n\n"
-                 f"**Title:** {video_title_clean}\n"
-                 f"**Resolution:** {res_display}\n"
-                 f"**Status:** Starting download...\n\n"
-                 f"🛑 Send `/cancel` to stop"
-        )
-        
-        # Custom progress hook
-        def custom_progress_hook(d):
-            progress_hook(d, status_message, status_message.id)
-        
-        ydl_opts['progress_hooks'] = [custom_progress_hook]
-        
-        # Start download
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
-            # Get downloaded file path
-            downloaded_file = ydl.prepare_filename(info)
-            if downloaded_file.endswith('.webm'):
-                downloaded_file = downloaded_file.replace('.webm', '.mp4')
-            elif downloaded_file.endswith('.mkv'):
-                downloaded_file = downloaded_file.replace('.mkv', '.mp4')
-            
-            # Find actual file
-            if not os.path.exists(downloaded_file):
-                base_name = downloaded_file.rsplit('.', 1)[0]
-                for ext in ['.mp4', '.mkv', '.webm']:
-                    if os.path.exists(base_name + ext):
-                        downloaded_file = base_name + ext
-                        break
-            
-            # Update status
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_message.id,
-                text="📤 **Uploading to Telegram...**"
-            )
-            
-            # Prepare caption
-            caption = (
-                f"**🎬 YouTube Video**\n"
-                f"**Title:** {info.get('title', 'Unknown')}\n"
-                f"**Resolution:** {res_display}\n"
-                f"**Duration:** {info.get('duration', 0) // 60}:{info.get('duration', 0) % 60:02d}\n"
-                f"**Channel:** {info.get('uploader', 'Unknown')}\n\n"
-                f"**Downloaded by:** {CREDIT}"
-            )
-            
-            # Upload video
-            await bot.send_video(
-                chat_id=chat_id,
-                video=downloaded_file,
-                caption=caption,
-                supports_streaming=True,
-                progress=lambda current, total: asyncio.sleep(0.1)  # Simple progress
-            )
-            
-            # Delete status message
-            await bot.delete_messages(chat_id, status_message.id)
-            
-            # Clean up
-            if os.path.exists(downloaded_file):
-                os.remove(downloaded_file)
-            
-            return True, "✅ **Download Complete!**"
-            
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        if "Private video" in error_msg:
-            return False, "🔒 **Private Video**\nThis video is private and cannot be downloaded."
-        elif "Members-only" in error_msg:
-            return False, "👥 **Members-Only Video**\nThis video is for channel members only."
-        elif "Sign in" in error_msg or "login" in error_msg.lower():
-            return False, (
-                "🔑 **Authentication Required**\n\n"
-                "This video requires login. Please:\n"
-                "1. Export cookies from your browser\n"
-                "2. Send them using `/cookies` command\n"
-                "3. Try downloading again"
-            )
-        else:
-            return False, f"❌ **Download Failed**\n\nError: {error_msg[:200]}"
-    
-    except Exception as e:
-        return False, f"❌ **Unexpected Error**\n\n{str(e)[:200]}"
-    
-    finally:
-        processing_request = False
-        cancel_requested = False
+            logger.error(f"Progress callback error: {e}")
 
 # ============================================================================
 # Bot Handlers
@@ -273,216 +246,330 @@ async def download_youtube_video(url, chat_id, resolution="720"):
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
-    """Start command handler"""
+    """Start command"""
     await message.reply_text(
         f"🎬 **YouTube Downloader Bot**\n\n"
-        f"**Features:**\n"
-        f"• Download YouTube videos\n"
-        f"• Multiple resolutions (144p to 1080p)\n"
-        f"• Members-only videos support (with cookies)\n"
-        f"• Fast downloads\n\n"
+        f"**Bot Status:** ✅ Online\n"
+        f"**FFmpeg:** {'✅ Installed' if check_ffmpeg() else '❌ Missing'}\n\n"
         f"**Commands:**\n"
-        f"• Send YouTube URL directly\n"
-        f"• `/download [url]` - Download video\n"
-        f"• `/cookies` - Upload cookies file\n"
-        f"• `/getcookies` - Get current cookies\n"
-        f"• `/cancel` - Cancel download\n"
-        f"• `/status` - Check bot status\n\n"
-        f"**Made by:** {CREDIT}"
+        f"• Send any YouTube link\n"
+        f"• /cookies - Upload cookies.txt\n"
+        f"• /quality - Check available qualities\n"
+        f"• /status - Bot status\n"
+        f"• /cancel - Cancel download\n\n"
+        f"**Developer:** {CREDIT}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📖 Help", callback_data="help"),
+             InlineKeyboardButton("🔧 Support", url="https://t.me/example")]
+        ])
     )
-
-@bot.on_message(filters.command("download") & filters.private)
-async def download_command(client: Client, message: Message):
-    """Handle /download command"""
-    global processing_request
-    
-    if processing_request:
-        await message.reply_text("⏳ **Please wait**, another download is in progress.")
-        return
-    
-    if len(message.command) < 2:
-        await message.reply_text(
-            "📝 **Usage:**\n\n"
-            "Send YouTube URL directly or use:\n"
-            "`/download [youtube_url]`\n\n"
-            "Example:\n"
-            "`/download https://youtu.be/dQw4w9WgXcQ`"
-        )
-        return
-    
-    url = message.command[1]
-    await handle_youtube_url(message, url)
 
 @bot.on_message(filters.command("cookies") & filters.private)
 async def cookies_handler(client: Client, message: Message):
     """Handle cookies upload"""
     if not message.reply_to_message or not message.reply_to_message.document:
         await message.reply_text(
-            "📁 **Please reply to a cookies file with this command.**\n\n"
-            "How to get cookies:\n"
-            "1. Install 'Get cookies.txt LOCALLY' extension\n"
-            "2. Go to YouTube and login\n"
+            "📁 **How to upload cookies:**\n\n"
+            "1. Install 'Get cookies.txt' browser extension\n"
+            "2. Login to YouTube in browser\n"
             "3. Export cookies as .txt file\n"
-            "4. Send it here with /cookies command"
+            "4. Reply to that file with /cookies\n\n"
+            "This allows downloading private/members-only videos."
         )
         return
     
     doc = message.reply_to_message.document
     if not doc.file_name.endswith('.txt'):
-        await message.reply_text("❌ **Invalid file type.** Please upload a .txt file.")
+        await message.reply_text("❌ Please upload a .txt file")
         return
     
     try:
-        # Download the file
-        await message.reply_text("📥 Downloading cookies file...")
-        file_path = await client.download_media(doc)
+        # Download file
+        temp_path = await client.download_media(doc)
         
-        # Read and save cookies
-        with open(file_path, 'r') as f:
-            cookies_content = f.read()
+        # Validate it's a cookies file
+        with open(temp_path, 'r') as f:
+            content = f.read()
+            if 'youtube.com' not in content and '# Netscape HTTP Cookie File' not in content:
+                os.remove(temp_path)
+                await message.reply_text("❌ This doesn't look like a valid cookies.txt file")
+                return
         
+        # Save to cookies file
         with open(COOKIES_FILE, 'w') as f:
-            f.write(cookies_content)
+            f.write(content)
         
-        # Clean up
-        os.remove(file_path)
+        os.remove(temp_path)
         
         await message.reply_text(
-            "✅ **Cookies updated successfully!**\n\n"
-            "You can now download members-only/private videos."
+            "✅ **Cookies uploaded successfully!**\n\n"
+            "You can now download private/members-only videos.\n"
+            f"File saved as: `{COOKIES_FILE.name}`"
         )
-        
     except Exception as e:
-        await message.reply_text(f"❌ **Failed to update cookies:** {str(e)}")
+        await message.reply_text(f"❌ Error: {str(e)}")
 
-@bot.on_message(filters.command("getcookies") & filters.private)
-async def get_cookies_handler(client: Client, message: Message):
-    """Get current cookies file"""
-    if not os.path.exists(COOKIES_FILE):
-        await message.reply_text("📭 **No cookies file found.**")
+@bot.on_message(filters.command("quality") & filters.private)
+async def quality_handler(client: Client, message: Message):
+    """Check available qualities for a video"""
+    if len(message.command) < 2:
+        await message.reply_text(
+            "📝 **Usage:** `/quality [youtube_url]`\n\n"
+            "Example: `/quality https://youtu.be/example`"
+        )
         return
     
+    url = message.command[1]
+    status_msg = await message.reply_text("🔍 Checking available qualities...")
+    
     try:
-        await client.send_document(
-            chat_id=message.chat.id,
-            document=COOKIES_FILE,
-            caption="🔐 **YouTube Cookies File**"
-        )
+        info = await get_video_info(url, COOKIES_FILE.exists())
+        if not info:
+            await status_msg.edit("❌ Failed to fetch video info")
+            return
+        
+        formats = get_available_formats(info)
+        if not formats:
+            await status_msg.edit("❌ No video formats found")
+            return
+        
+        quality_text = f"📊 **Available Qualities for:**\n`{info.get('title', 'Unknown')[:50]}`\n\n"
+        for fmt in formats:
+            size = f"{fmt['filesize']/(1024*1024):.1f}MB" if fmt['filesize'] else "Unknown"
+            quality_text += f"• **{fmt['height']}p** - {fmt['ext']} - {size}\n"
+        
+        quality_text += f"\n**Total Duration:** {info.get('duration', 0)//60}:{info.get('duration', 0)%60:02d}"
+        
+        await status_msg.edit(quality_text)
+        
     except Exception as e:
-        await message.reply_text(f"❌ **Error:** {str(e)}")
+        await status_msg.edit(f"❌ Error: {str(e)}")
+
+@bot.on_message(filters.command("status") & filters.private)
+async def status_handler(client: Client, message: Message):
+    """Bot status"""
+    import psutil
+    import platform
+    
+    # System info
+    cpu_percent = psutil.cpu_percent()
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    # Bot info
+    total_downloads = len(list(DOWNLOAD_PATH.glob('*.mp4')))
+    
+    status_text = (
+        f"🤖 **Bot Status**\n\n"
+        f"**System:**\n"
+        f"• CPU: {cpu_percent}%\n"
+        f"• RAM: {memory.percent}%\n"
+        f"• Disk: {disk.percent}%\n"
+        f"• Python: {platform.python_version()}\n\n"
+        f"**Bot:**\n"
+        f"• FFmpeg: {'✅' if check_ffmpeg() else '❌'}\n"
+        f"• Cookies: {'✅' if COOKIES_FILE.exists() else '❌'}\n"
+        f"• Downloads: {total_downloads}\n"
+        f"• Active: {len(current_tasks)}\n\n"
+        f"**Developer:** {CREDIT}"
+    )
+    
+    await message.reply_text(status_text)
 
 @bot.on_message(filters.command("cancel") & filters.private)
 async def cancel_handler(client: Client, message: Message):
     """Cancel current download"""
-    global cancel_requested, processing_request
+    global cancel_requested
     
-    if processing_request:
+    user_id = message.from_user.id
+    if user_id in current_tasks:
         cancel_requested = True
-        await message.reply_text("🛑 **Cancellation requested...**")
+        current_tasks[user_id].cancel()
+        await message.reply_text("🛑 Download cancelled")
     else:
-        await message.reply_text("ℹ️ **No active download to cancel.**")
+        await message.reply_text("ℹ️ No active download to cancel")
 
-@bot.on_message(filters.command("status") & filters.private)
-async def status_handler(client: Client, message: Message):
-    """Check bot status"""
-    global processing_request
-    
-    status_text = "🟢 **Bot is running**\n\n"
-    status_text += f"**Active Downloads:** {1 if processing_request else 0}\n"
-    status_text += f"**Cookies File:** {'✅ Present' if os.path.exists(COOKIES_FILE) else '❌ Missing'}\n"
-    status_text += f"**Storage:** {round(os.path.getsize(DOWNLOAD_PATH) / (1024*1024), 2)} MB used\n\n"
-    status_text += f"**Credit:** {CREDIT}"
-    
-    await message.reply_text(status_text)
-
-@bot.on_message(filters.regex(r'(youtube\.com|youtu\.be)') & filters.private)
-async def youtube_url_handler(client: Client, message: Message):
-    """Auto-detect YouTube URLs"""
+@bot.on_message(filters.regex(r'(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^\s]+)') & filters.private)
+async def youtube_handler(client: Client, message: Message):
+    """Handle YouTube URLs"""
     global processing_request
     
     if processing_request:
-        await message.reply_text("⏳ **Please wait**, another download is in progress.")
+        await message.reply_text("⏳ Please wait, another download is in progress...")
         return
     
-    url = message.text.strip()
-    await handle_youtube_url(message, url)
-
-async def handle_youtube_url(message: Message, url: str):
-    """Handle YouTube URL download"""
-    global processing_request
+    url = message.matches[0].group(0)
+    user_id = message.from_user.id
+    
+    # Check if already downloading
+    if user_id in current_tasks:
+        await message.reply_text("⚠️ You already have a download in progress")
+        return
     
     processing_request = True
+    current_tasks[user_id] = asyncio.current_task()
     
-    # Ask for resolution
-    keyboard = [
-        ["144p", "240p", "360p"],
-        ["480p", "720p", "1080p"],
-        ["Best Quality"]
-    ]
-    
-    reply_markup = {
-        "keyboard": keyboard,
-        "resize_keyboard": True,
-        "one_time_keyboard": True
-    }
-    
-    # Send resolution selection
-    resolution_msg = await message.reply_text(
-        "📏 **Select Resolution:**\n\n"
-        "Choose your preferred video quality:",
-        reply_markup=reply_markup
-    )
-    
-    # Wait for resolution selection
     try:
-        resolution_response = await bot.listen(
-            chat_id=message.chat.id,
-            filters=filters.text & filters.user(message.from_user.id),
-            timeout=30
+        # Ask for quality
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("144p", callback_data=f"quality_144_{url}"),
+                InlineKeyboardButton("360p", callback_data=f"quality_360_{url}"),
+                InlineKeyboardButton("720p", callback_data=f"quality_720_{url}")
+            ],
+            [
+                InlineKeyboardButton("1080p", callback_data=f"quality_1080_{url}"),
+                InlineKeyboardButton("Best", callback_data=f"quality_best_{url}")
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_download")]
+        ])
+        
+        await message.reply_text(
+            "📏 **Select Video Quality:**\n\n"
+            "Choose the resolution you want to download:",
+            reply_markup=keyboard
         )
-        resolution = resolution_response.text.lower().replace('p', '').replace('best quality', 'best')
         
-        # Remove keyboard
-        await resolution_msg.delete()
-        await resolution_response.delete()
-        
-        # Start download
-        success, result = await download_youtube_video(
-            url=url,
-            chat_id=message.chat.id,
-            resolution=resolution
-        )
-        
-        await message.reply_text(result)
-        
-    except asyncio.TimeoutError:
-        await resolution_msg.delete()
-        await message.reply_text("⏱️ **Timeout** - No resolution selected.")
     except Exception as e:
-        await message.reply_text(f"❌ **Error:** {str(e)}")
-    finally:
+        await message.reply_text(f"❌ Error: {str(e)}")
         processing_request = False
+        current_tasks.pop(user_id, None)
+
+@bot.on_callback_query(filters.regex(r'^quality_'))
+async def quality_callback(client, callback_query):
+    """Handle quality selection"""
+    global cancel_requested
+    
+    data = callback_query.data
+    parts = data.split('_')
+    
+    if len(parts) < 3:
+        await callback_query.answer("Invalid selection")
+        return
+    
+    quality = parts[1]
+    url = '_'.join(parts[2:])  # Reconstruct URL
+    
+    await callback_query.message.edit_text(f"⏳ Starting download at {quality}p...")
+    
+    user_id = callback_query.from_user.id
+    chat_id = callback_query.message.chat.id
+    message_id = callback_query.message.id
+    
+    try:
+        # Download video
+        success, result = await download_video_with_progress(
+            url=url,
+            resolution=quality if quality != 'best' else 2160,
+            chat_id=chat_id,
+            message_id=message_id
+        )
+        
+        if success and isinstance(result, str) and os.path.exists(result):
+            # Upload to Telegram
+            await callback_query.message.edit_text("📤 Uploading to Telegram...")
+            
+            # Get video info for caption
+            info = await get_video_info(url, COOKIES_FILE.exists())
+            title = info.get('title', 'YouTube Video') if info else "YouTube Video"
+            duration = info.get('duration', 0) if info else 0
+            
+            caption = (
+                f"🎬 **{title[:50]}**\n\n"
+                f"📊 Quality: {quality}p\n"
+                f"⏱ Duration: {duration//60}:{duration%60:02d}\n"
+                f"👤 Downloaded by: {callback_query.from_user.mention}\n\n"
+                f"🔗 **Original URL:** [Click Here]({url})"
+            )
+            
+            # Send video
+            await client.send_video(
+                chat_id=chat_id,
+                video=result,
+                caption=caption,
+                supports_streaming=True,
+                progress=progress_bar,
+                progress_args=(client, callback_query.message, "📤 Uploading...")
+            )
+            
+            # Clean up
+            os.remove(result)
+            await callback_query.message.delete()
+            
+        else:
+            await callback_query.message.edit_text(f"❌ Download failed:\n{result}")
+            
+    except asyncio.CancelledError:
+        await callback_query.message.edit_text("🛑 Download cancelled by user")
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        await callback_query.message.edit_text(f"❌ Error: {str(e)[:200]}")
+    finally:
+        global processing_request
+        processing_request = False
+        current_tasks.pop(user_id, None)
+        cancel_requested = False
+
+@bot.on_callback_query(filters.regex(r'^cancel_download'))
+async def cancel_callback(client, callback_query):
+    """Cancel download from inline keyboard"""
+    global cancel_requested
+    cancel_requested = True
+    await callback_query.message.edit_text("🛑 Download cancelled")
+    await callback_query.answer("Cancelled")
+
+async def progress_bar(current, total, client, message, status):
+    """Progress bar for upload"""
+    try:
+        percentage = (current / total) * 100
+        bar_length = 10
+        filled = int(bar_length * percentage // 100)
+        bar = '▓' * filled + '░' * (bar_length - filled)
+        
+        await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            text=f"{status}\n```[{bar}] {percentage:.1f}%```"
+        )
+    except Exception:
+        pass
 
 # ============================================================================
 # Web Server for Render
 # ============================================================================
 
 async def health_check(request):
-    """Health check endpoint for Render"""
-    return web.Response(text="YouTube Bot is running!", status=200)
+    """Health check endpoint"""
+    return web.Response(text="Bot is running!", status=200)
+
+async def bot_info(request):
+    """Bot info endpoint"""
+    try:
+        me = await bot.get_me()
+        info = {
+            "status": "online",
+            "bot_username": me.username,
+            "bot_id": me.id,
+            "ffmpeg": check_ffmpeg(),
+            "cookies": COOKIES_FILE.exists()
+        }
+        return web.json_response(info)
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 async def start_web_server():
-    """Start aiohttp web server for Render"""
+    """Start aiohttp web server"""
     app = web.Application()
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
+    app.router.add_get('/info', bot_info)
     
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, HOST, PORT)
     await site.start()
     
-    logger.info(f"Web server started on http://{HOST}:{PORT}")
+    logger.info(f"✅ Web server running on http://{HOST}:{PORT}")
     return runner
 
 # ============================================================================
@@ -490,42 +577,64 @@ async def start_web_server():
 # ============================================================================
 
 async def main():
-    """Main function to run bot and web server"""
-    logger.info("Starting YouTube Downloader Bot...")
+    """Main function"""
+    logger.info("🚀 Starting YouTube Downloader Bot...")
     
-    # Validate environment variables
-    if not all([API_ID, API_HASH, BOT_TOKEN]):
-        logger.error("Missing required environment variables!")
-        logger.error("Please set API_ID, API_HASH, and BOT_TOKEN")
+    # Check environment
+    missing_vars = []
+    if not API_ID:
+        missing_vars.append("API_ID")
+    if not API_HASH:
+        missing_vars.append("API_HASH")
+    if not BOT_TOKEN:
+        missing_vars.append("BOT_TOKEN")
+    
+    if missing_vars:
+        logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
         sys.exit(1)
     
+    # Check FFmpeg
+    if not check_ffmpeg():
+        logger.warning("⚠️ FFmpeg not found. Some features may not work.")
+    
+    # Start web server first (for Render health checks)
     try:
-        # Start web server for Render
         web_runner = await start_web_server()
-        
-        # Start the bot
+    except Exception as e:
+        logger.error(f"❌ Failed to start web server: {e}")
+        web_runner = None
+    
+    # Start the bot
+    try:
         await bot.start()
-        
-        # Get bot info
         bot_info = await bot.get_me()
-        logger.info(f"Bot started: @{bot_info.username}")
-        logger.info(f"Bot ID: {bot_info.id}")
+        logger.info(f"✅ Bot started: @{bot_info.username}")
+        
+        # Set bot commands
+        await bot.set_bot_commands([
+            ("start", "Start the bot"),
+            ("cookies", "Upload cookies.txt"),
+            ("quality", "Check available qualities"),
+            ("status", "Bot status"),
+            ("cancel", "Cancel download")
+        ])
         
         # Keep running
-        await asyncio.Event().wait()
+        await idle()
         
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+        logger.error(f"❌ Failed to start bot: {e}")
     finally:
         # Cleanup
         await bot.stop()
-        await web_runner.cleanup()
+        if web_runner:
+            await web_runner.cleanup()
+        logger.info("👋 Bot stopped")
 
 if __name__ == "__main__":
-    # Run the bot
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("👋 Bot stopped by user")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"❌ Fatal error: {e}")
