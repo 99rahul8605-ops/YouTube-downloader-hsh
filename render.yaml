@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: youtube-downloader-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python youtube_bot.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: CREDIT
+        value: "YouTube Downloader Bot"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    disk:
+      name: downloads
+      mountPath: /opt/render/project/src/downloads
+      sizeGB: 1
