@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+venv/
+env/
+ENV/
+
+# Bot specific
+downloads/
+*.session
+*.log
+youtube_cookies.txt
+
+# OS
+.DS_Store
+Thumbs.db
